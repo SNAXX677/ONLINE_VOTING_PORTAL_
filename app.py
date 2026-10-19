@@ -1,18 +1,24 @@
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import parse_qs, urlparse, urlencode
+from urllib.parse import parse_qs, urlparse
 from pathlib import Path
 from html import escape
 from http.cookies import SimpleCookie
 import secrets
 import os
+import time
 
-HOST = "127.0.0.1"
-PORT = 8000
+HOST = os.environ.get("HOST", "127.0.0.1")
+PORT = int(os.environ.get("PORT", "8000"))
 
 BASE_DIR = Path(__file__).resolve().parent
 
-# Results PIN — ise apne hisaab se change kar sakte ho
-RESULTS_PIN = os.environ.get("RESULTS_PIN", "1234")
+# Results PIN: set your own with the RESULTS_PIN environment variable
+DEFAULT_PIN = "1234"
+RESULTS_PIN = os.environ.get("RESULTS_PIN", DEFAULT_PIN)
+
+MAX_BODY = 10_000          # largest form body we accept (bytes)
+MAX_PIN_ATTEMPTS = 5       # wrong PINs allowed ...
+LOCK_SECONDS = 60          # ... before that client is locked out
 
 candidates = [
     "Aarav Sharma",
@@ -23,9 +29,27 @@ candidates = [
 
 symbols = ["🧑‍💼", "👩‍💼", "🧑‍🎓", "🗳️"]
 
-votes = [0, 0, 0, 0]
+votes = [0] * len(candidates)
 voted_users = set()
 valid_result_tokens = set()
+pin_attempts = {}          # client ip -> [failed_count, locked_until]
+
+# Fixed messages. The URL carries only a short code, so nobody can put
+# their own text on the page by crafting a link.
+DEFAULT_MESSAGE = "Welcome to VoteSphere. Select a candidate and cast your vote."
+MESSAGES = {
+    "ok": "Your vote was submitted successfully!",
+    "bad_id": "Invalid Voter ID. Enter 1 to 12 digits only.",
+    "dup": "This Voter ID has already voted.",
+    "bad_choice": "Please select a valid candidate.",
+}
+
+
+def pin_matches(supplied, expected):
+    # compare_digest raises TypeError for non-ASCII str, so compare bytes
+    return secrets.compare_digest(
+        supplied.encode("utf-8"), expected.encode("utf-8")
+    )
 
 
 class VotingServer(BaseHTTPRequestHandler):
@@ -37,12 +61,12 @@ class VotingServer(BaseHTTPRequestHandler):
         data = content.encode("utf-8")
 
         self.send_response(status)
-        self.send_header(
-            "Content-Type", "text/html; charset=utf-8"
-        )
+        self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "same-origin")
 
         if extra_headers:
             for key, value in extra_headers:
@@ -52,10 +76,13 @@ class VotingServer(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def read_form(self):
-        length = int(self.headers.get("Content-Length", "0"))
-        raw = self.rfile.read(length).decode(
-            "utf-8", errors="replace"
-        )
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = 0
+
+        length = max(0, min(length, MAX_BODY))
+        raw = self.rfile.read(length).decode("utf-8", errors="replace")
         return parse_qs(raw, keep_blank_values=True)
 
     def redirect(self, location, headers=None):
@@ -202,6 +229,8 @@ class VotingServer(BaseHTTPRequestHandler):
 
     def make_pin_form(self, error=""):
         error_html = ""
+        # After a wrong PIN the panel must be visible, or the error is hidden
+        panel_class = "" if error else "hidden"
 
         if error:
             error_html = f"""
@@ -218,7 +247,7 @@ class VotingServer(BaseHTTPRequestHandler):
 
         <div id="results-pin-panel"
             class="mt-6 rounded-2xl border border-slate-700
-            bg-slate-950 p-5 hidden">
+            bg-slate-950 p-5 {panel_class}">
 
             <form action="/results" method="POST">
                 <label for="results-pin"
@@ -229,10 +258,8 @@ class VotingServer(BaseHTTPRequestHandler):
                 <input id="results-pin"
                     name="pin"
                     type="password"
-                    inputmode="numeric"
-                    pattern="[0-9]{{4,12}}"
-                    maxlength="12"
                     autocomplete="off"
+                    maxlength="64"
                     required
                     placeholder="Enter PIN"
                     class="w-full rounded-xl border border-slate-700
@@ -251,42 +278,33 @@ class VotingServer(BaseHTTPRequestHandler):
         </div>
 
         <p class="mt-4 text-xs text-slate-500">
-            Votes remain hidden unless the server verifies the PIN.
+            Vote counts stay hidden unless the server verifies the PIN.
         </p>
         """
 
     def render_page(self, message="", pin_error=""):
         try:
-            page = (
-                BASE_DIR / "index.html"
-            ).read_text(encoding="utf-8")
+            page = (BASE_DIR / "index.html").read_text(encoding="utf-8")
 
         except FileNotFoundError:
             self.send_html(
-                "<h1>index.html nahi mili. Dono files ek folder mein rakho.</h1>",
+                "<h1>index.html not found. Keep both files in the same folder.</h1>",
                 500
             )
             return
-
-        total = sum(votes)
-
-        page = page.replace("{{TOTAL}}", str(total))
-        page = page.replace("{{OPTIONS}}", self.make_options())
-
-        page = page.replace(
-            "{{MESSAGE}}",
-            escape(
-                message or
-                "Welcome to VoteSphere. Select a candidate and cast your vote."
-            )
-        )
 
         if self.get_result_token():
             results_html = self.make_results()
         else:
             results_html = self.make_pin_form(pin_error)
 
+        page = page.replace("{{TOTAL}}", str(sum(votes)))
+        page = page.replace("{{COUNT}}", f"{len(candidates):02d}")
+        page = page.replace("{{OPTIONS}}", self.make_options())
         page = page.replace("{{RESULTS}}", results_html)
+        # The message is inserted LAST so that text inside it can never
+        # be treated as a template placeholder.
+        page = page.replace("{{MESSAGE}}", escape(message or DEFAULT_MESSAGE))
 
         self.send_html(page)
 
@@ -297,10 +315,8 @@ class VotingServer(BaseHTTPRequestHandler):
             self.send_error(404, "Page not found")
             return
 
-        query = parse_qs(parsed.query)
-        message = query.get("message", [""])[0]
-
-        self.render_page(message=message)
+        code = parse_qs(parsed.query).get("m", [""])[0]
+        self.render_page(message=MESSAGES.get(code, ""))
 
     def do_POST(self):
         path = urlparse(self.path).path
@@ -316,40 +332,50 @@ class VotingServer(BaseHTTPRequestHandler):
                 or not voter_id.isdigit()
                 or not (1 <= len(voter_id) <= 12)
             ):
-                message = (
-                    "Invalid Voter ID. Enter 1 to 12 digits only."
-                )
-
-            elif voter_id in voted_users:
-                message = "This Voter ID has already voted."
+                code = "bad_id"
 
             else:
-                try:
-                    index = int(choice)
+                # "7", "07" and "007" are the same voter
+                voter_key = str(int(voter_id))
 
-                    if not 0 <= index < len(candidates):
-                        raise ValueError
+                if voter_key in voted_users:
+                    code = "dup"
 
-                    votes[index] += 1
-                    voted_users.add(voter_id)
+                else:
+                    try:
+                        index = int(choice)
 
-                    message = "Your vote was submitted successfully!"
+                        if not 0 <= index < len(candidates):
+                            raise ValueError
 
-                except (ValueError, TypeError):
-                    message = "Please select a valid candidate."
+                        votes[index] += 1
+                        voted_users.add(voter_key)
+                        code = "ok"
 
-            self.redirect(
-                "/?" + urlencode({"message": message})
-            )
+                    except (ValueError, TypeError):
+                        code = "bad_choice"
+
+            self.redirect("/?m=" + code)
             return
 
         # RESULTS PIN VERIFICATION
         if path == "/results":
+            ip = self.client_address[0]
+            fails, locked_until = pin_attempts.get(ip, [0, 0])
+            now = time.time()
+
+            if locked_until > now:
+                wait = int(locked_until - now) + 1
+                self.render_page(
+                    message="Too many wrong PINs.",
+                    pin_error=f"Locked. Try again in {wait} seconds."
+                )
+                return
+
             supplied_pin = form.get("pin", [""])[0]
 
-            if secrets.compare_digest(
-                supplied_pin, RESULTS_PIN
-            ):
+            if pin_matches(supplied_pin, RESULTS_PIN):
+                pin_attempts.pop(ip, None)
                 token = secrets.token_urlsafe(32)
                 valid_result_tokens.add(token)
 
@@ -365,6 +391,13 @@ class VotingServer(BaseHTTPRequestHandler):
                 )
 
             else:
+                fails += 1
+
+                if fails >= MAX_PIN_ATTEMPTS:
+                    pin_attempts[ip] = [0, now + LOCK_SECONDS]
+                else:
+                    pin_attempts[ip] = [fails, 0]
+
                 self.render_page(
                     message="Incorrect PIN. Please try again.",
                     pin_error="Incorrect PIN. Votes are still hidden."
@@ -398,7 +431,11 @@ if __name__ == "__main__":
     server = HTTPServer((HOST, PORT), VotingServer)
 
     print(f"VoteSphere is running at http://{HOST}:{PORT}")
-    print("Default Results PIN: 1234")
+
+    if RESULTS_PIN == DEFAULT_PIN:
+        print("WARNING: using the default Results PIN 1234. "
+              "Set the RESULTS_PIN environment variable to change it.")
+
     print("Press Ctrl+C to stop the server.")
 
     try:
