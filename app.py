@@ -21,10 +21,10 @@ MAX_PIN_ATTEMPTS = 5       # wrong PINs allowed ...
 LOCK_SECONDS = 60          # ... before that client is locked out
 
 candidates = [
-    "Aarav Sharma",
-    "Priya Verma",
-    "Rahul Patil",
-    "NOTA"
+    "Rohit Sharma",
+    "Tkzin",
+    "Boaster",
+    "Crashies"
 ]
 
 symbols = ["🧑‍💼", "👩‍💼", "🧑‍🎓", "🗳️"]
